@@ -5,7 +5,7 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="System.Buffers" Version="4.5.1" />
-    <PackageReference Include="System.Memory" Version="4.5.4" />
+    <PackageReference Include="System.Memory" Version="4.5.5" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\Fleck\Fleck.csproj" />
