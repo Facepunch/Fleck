@@ -13,6 +13,7 @@ namespace Fleck.Handlers
         private static readonly Encoding UTF8 = new UTF8Encoding(false, true);
         private static readonly SHA1 SHA1 = SHA1.Create();
         private static readonly ThreadLocal<StringBuilder> StringBuilder = new ThreadLocal<StringBuilder>(() => new StringBuilder(1024));
+        private static readonly ThreadLocal<SHA1> sha1Hash = new ThreadLocal<SHA1>(() => SHA1.Create());
 
         private readonly WebSocketHttpRequest _request;
         private readonly IWebSocketConnection _connection;
@@ -279,7 +280,7 @@ namespace Fleck.Handlers
         {
             var combined = requestKey + WebSocketResponseGuid;
 
-            var bytes = SHA1.ComputeHash(Encoding.ASCII.GetBytes(combined));
+            var bytes = sha1Hash.Value.ComputeHash(Encoding.ASCII.GetBytes(combined));
 
             return Convert.ToBase64String(bytes);
         }
