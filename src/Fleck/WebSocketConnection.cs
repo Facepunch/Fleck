@@ -293,6 +293,9 @@ namespace Fleck
             Socket.Dispose();
             _closing = false;
 
+            Handler?.Dispose();
+            Handler = null;
+
             if (_receiveBuffer != null)
             {
                 ArrayPool<byte>.Shared.Return(_receiveBuffer);
