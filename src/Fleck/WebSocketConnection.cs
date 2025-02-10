@@ -248,7 +248,7 @@ namespace Fleck
         {
             try
             {
-                if (Interlocked.Increment(ref _pendingSendCount) > 256)
+                if (Interlocked.Increment(ref _pendingSendCount) > 2048)
                 {
                     bytes.Dispose(); // we can safely dispose here since we're not sending it
                     throw new InvalidOperationException("Too many pending sends on WebSocket connection. Disconnecting.");
