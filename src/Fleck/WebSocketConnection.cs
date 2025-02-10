@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Buffers;
 using System.IO;
+using System.Threading;
 
 namespace Fleck
 {
@@ -23,6 +24,7 @@ namespace Fleck
         private readonly Action<IWebSocketConnection> _initialize;
         private readonly Func<IWebSocketConnection, WebSocketHttpRequest, IHandler> _handlerFactory;
         private readonly Func<ArraySegment<byte>, WebSocketHttpRequest> _parseRequest;
+        private int _pendingSendCount;
         private byte[] _receiveBuffer;
         private int _receiveOffset;
         private bool _closing;
@@ -246,6 +248,12 @@ namespace Fleck
         {
             try
             {
+                if (Interlocked.Increment(ref _pendingSendCount) > 256)
+                {
+                    bytes.Dispose(); // we can safely dispose here since we're not sending it
+                    throw new InvalidOperationException("Too many pending sends on WebSocket connection. Disconnecting.");
+                }
+
                 // TODO: this allocates for the delegate - could probably avoid that with QueuedStream
                 Socket.Stream.BeginWrite(bytes.Data, 0, bytes.Length, result =>
                 {
@@ -254,6 +262,8 @@ namespace Fleck
 
                     try
                     {
+                        DecrementPending();
+
                         instance.Socket.Stream.EndWrite(result);
                         FleckLog.Debug($"Sent {bytes.Length} bytes");
 
@@ -280,7 +290,23 @@ namespace Fleck
             }
             catch (Exception e)
             {
+                if (!(e is InvalidOperationException))
+                {
+                    DecrementPending(); // only BeginWrite could throw this exception type so we should undo the increment
+                }
+
                 HandleWriteError(e);
+            }
+
+            return;
+
+            void DecrementPending()
+            {
+                if (Interlocked.Decrement(ref _pendingSendCount) < 0)
+                {
+                    FleckLog.Error("Pending send count on WebSocket connection has gone negative! Trying to fix it...");
+                    _pendingSendCount = 0;
+                }
             }
         }
 
@@ -292,6 +318,7 @@ namespace Fleck
             Socket.Close();
             Socket.Dispose();
             _closing = false;
+            _pendingSendCount = 0;
 
             Handler?.Dispose();
             Handler = null;
