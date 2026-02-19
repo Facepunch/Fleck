@@ -312,6 +312,8 @@ namespace Fleck
 
         private void CloseSocket()
         {
+            WebSocketServer.Limiter.Remove(Socket.RemoteIpAddress);
+
             _closing = true;
             OnClose();
             _closed = true;

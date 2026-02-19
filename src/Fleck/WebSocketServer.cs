@@ -13,13 +13,16 @@ namespace Fleck
         private readonly IPAddress _locationIP;
         private Action<IWebSocketConnection> _config;
 
-        public WebSocketServer(string location, bool supportDualStack = true)
+        public static readonly ConnectionLimiter Limiter = new ConnectionLimiter();
+
+        public WebSocketServer(string location, bool supportDualStack = true, int backlog = 100, int maxConnections = 500, int maxConnectionsPerIP = 5)
         {
             var uri = new Uri(location);
 
             Port = uri.Port;
             Location = location;
             SupportDualStack = supportDualStack;
+            Backlog = backlog;
 
             _locationIP = ParseIPAddress(uri);
             _scheme = uri.Scheme;
@@ -35,6 +38,8 @@ namespace Fleck
             }
 
             ListenerSocket = new SocketWrapper(socket);
+            Limiter.Clear();
+            Limiter.SetConnectionLimits(maxConnections, maxConnectionsPerIP);
         }
 
         public ISocket ListenerSocket { get; set; }
@@ -44,6 +49,7 @@ namespace Fleck
         public X509Certificate2 Certificate { get; set; }
         public SslProtocols EnabledSslProtocols { get; set; }
         public bool RestartAfterListenError { get; set; }
+        public int Backlog { get; set; }
 
         public bool IsSecure => _scheme == "wss" && Certificate != null;
 
@@ -58,10 +64,10 @@ namespace Fleck
 
             if (ipStr == "0.0.0.0")
                 return IPAddress.Any;
-            
-            if (ipStr == "[0000:0000:0000:0000:0000:0000:0000:0000]") 
+
+            if (ipStr == "[0000:0000:0000:0000:0000:0000:0000:0000]")
                 return IPAddress.IPv6Any;
-            
+
             try
             {
                 return IPAddress.Parse(ipStr);
@@ -76,7 +82,7 @@ namespace Fleck
         {
             var ipLocal = new IPEndPoint(_locationIP, Port);
             ListenerSocket.Bind(ipLocal);
-            ListenerSocket.Listen(100);
+            ListenerSocket.Listen(Backlog);
             Port = ((IPEndPoint)ListenerSocket.LocalEndPoint).Port;
             FleckLog.Info($"Server started at {Location} (actual port {Port})");
             if (_scheme == "wss")
@@ -120,7 +126,16 @@ namespace Fleck
             if (clientSocket == null) return; // socket closed
 
             FleckLog.Debug($"Client connected from {clientSocket.RemoteIpAddress}:{clientSocket.RemotePort.ToString()}");
+
+            bool allowed = Limiter.TryAdd(clientSocket.RemoteIpAddress);
+
             ListenForClients();
+
+            if (!allowed) // rate limit, don't initiate handshake, close socket immediately
+            {
+                clientSocket.Close();
+                return;
+            }
 
             WebSocketConnection connection = null;
 
