@@ -65,10 +65,8 @@ namespace Fleck
                     state.WindowStart = now;
                     state.AttemptCount = 0;
                 }
-                else
-                {
-                    state.WindowStart = now;
-                }
+
+                state.AttemptCount++;
 
                 if (_maxAttemptsPerWindow != -1 && state.AttemptCount >= _maxAttemptsPerWindow)
                 {
@@ -81,7 +79,6 @@ namespace Fleck
                 }
 
                 // no need to reject yet, increment
-                state.AttemptCount++;
                 state.ActiveConnections++;
                 _overallCount++;
 
