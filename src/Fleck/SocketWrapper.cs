@@ -1,13 +1,14 @@
+using Fleck.Helpers;
 using System;
 using System.IO;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
-using System.Threading.Tasks;
 using System.Threading;
-using Fleck.Helpers;
+using System.Threading.Tasks;
 
 namespace Fleck
 {
@@ -15,6 +16,13 @@ namespace Fleck
     {
         public const uint KeepAliveInterval = 60000;
         public const uint RetryInterval = 10000;
+        public const int RetryProbes = 3;
+
+        private const int SOL_TCP = 6;
+
+        private const int TCP_KEEPIDLE = 4;
+        private const int TCP_KEEPINTVL = 5;
+        private const int TCP_KEEPCNT = 6;
 
         private static readonly byte[] keepAliveValues;
     
@@ -57,7 +65,23 @@ namespace Fleck
             // The tcp keepalive default values on most systems
             // are huge (~7200s). Set them to something more reasonable.
             if (FleckRuntime.IsRunningOnWindows())
+            {
                 socket.IOControl(IOControlCode.KeepAliveValues, keepAliveValues, null);
+            }
+            else if (FleckRuntime.IsRunningOnLinux())
+            {
+                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                int fd = (int)socket.Handle;
+
+                // linux uses seconds, unlike milliseconds in windows - https://man7.org/linux/man-pages/man7/tcp.7.html
+                int keepAlive = (int)KeepAliveInterval / 1000;
+                int retryInterval = (int)RetryInterval / 1000;
+                int probeCount = RetryProbes;
+
+                setsockopt(fd, SOL_TCP, TCP_KEEPIDLE, ref keepAlive, sizeof(int));
+                setsockopt(fd, SOL_TCP, TCP_KEEPINTVL, ref retryInterval, sizeof(int));
+                setsockopt(fd, SOL_TCP, TCP_KEEPCNT, ref probeCount, sizeof(int));
+            }
         }
 
         public Task Authenticate(X509Certificate2 certificate, SslProtocols enabledSslProtocols, Action callback, Action<Exception> error)
@@ -120,5 +144,8 @@ namespace Fleck
             if (Stream != null) Stream.Close();
             if (_socket != null) _socket.Close();
         }
+
+        [DllImport("libc", SetLastError = true)]
+        private static extern int setsockopt(int sockfd, int level, int optname, ref int optval, uint optlen);
     }
 }

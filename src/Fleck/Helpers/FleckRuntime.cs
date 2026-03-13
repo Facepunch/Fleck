@@ -18,5 +18,10 @@ namespace Fleck.Helpers
             return (RuntimeInformation.IsOSPlatform(OSPlatform.Windows));
 #endif
         }
+
+        public static bool IsRunningOnLinux()
+        {
+            return RuntimeInformation.IsOSPlatform(OSPlatform.Linux);
+        }
     }
 }
