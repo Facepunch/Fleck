@@ -113,6 +113,14 @@ namespace Fleck
             }
         }
 
+        public void Remove()
+        {
+            lock (_sync)
+            {
+                _overallCount--;
+            }
+        }
+
         public void Clear()
         {
             lock (_sync)
