@@ -90,6 +90,9 @@ namespace Fleck
         {
             if (address == null)
             {
+                // likely an edge case we'll never hit but if we ever end up in a case where both the socket/connectioninfo have null ips
+                // we still want to decrement our total active connections to prevent exhausting our connection limits
+                Remove();
                 return;
             }
 

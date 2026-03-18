@@ -29,12 +29,14 @@ namespace Fleck
         private int _receiveOffset;
         private bool _closing;
         private bool _closed;
+        private readonly ConnectionLimiter _limiter;
 
         public WebSocketConnection(
             ISocket socket,
             Action<IWebSocketConnection> initialize,
             Func<ArraySegment<byte>, WebSocketHttpRequest> parseRequest,
-            Func<IWebSocketConnection, WebSocketHttpRequest, IHandler> handlerFactory)
+            Func<IWebSocketConnection, WebSocketHttpRequest, IHandler> handlerFactory,
+            ConnectionLimiter limiter)
         {
             Socket = socket;
             OnOpen = () => { };
@@ -47,6 +49,7 @@ namespace Fleck
             _initialize = initialize;
             _handlerFactory = handlerFactory;
             _parseRequest = parseRequest;
+            _limiter = limiter;
         }
 
         public void Send(string message)
@@ -314,16 +317,7 @@ namespace Fleck
         {
             // if keepalive has kicked in this may be a dead socket, in which case we'll want to fallback to connectioninfo
             var address = Socket.RemoteIpAddress ?? ConnectionInfo.ClientIpAddress;
-            if (address != null)
-            {
-                WebSocketServer.Limiter.Remove(address);
-            }
-            else
-            {
-                // likely an edge case we'll never hit but if we ever end up in a case where both the socket/connectioninfo have null ips
-                // we still want to decrement our total active connections to prevent exhausting our connection limits
-                WebSocketServer.Limiter.Remove();
-            }
+            _limiter.Remove(address);
 
             _closing = true;
             OnClose();

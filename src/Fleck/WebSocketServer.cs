@@ -13,7 +13,7 @@ namespace Fleck
         private readonly IPAddress _locationIP;
         private Action<IWebSocketConnection> _config;
 
-        public static readonly ConnectionLimiter Limiter = new ConnectionLimiter();
+        public readonly ConnectionLimiter Limiter;
 
         public WebSocketServer(string location, bool supportDualStack = true, int backlog = 100, int maxConnections = 500, int maxConnectionsPerIP = 5)
         {
@@ -38,7 +38,7 @@ namespace Fleck
             }
 
             ListenerSocket = new SocketWrapper(socket);
-            Limiter.Clear();
+            Limiter = new ConnectionLimiter();
             Limiter.SetConnectionLimits(maxConnections, maxConnectionsPerIP);
         }
 
@@ -143,7 +143,8 @@ namespace Fleck
                 clientSocket,
                 _config,
                 bytes => RequestParser.Parse(bytes, _scheme),
-                (c, r) => HandlerFactory.BuildHandler(r, c));
+                (c, r) => HandlerFactory.BuildHandler(r, c),
+                Limiter);
 
             if (IsSecure)
             {
