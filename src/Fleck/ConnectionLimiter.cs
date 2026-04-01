@@ -65,8 +65,10 @@ namespace Fleck
                     state.WindowStart = now;
                     state.AttemptCount = 0;
                 }
-
-                state.AttemptCount++;
+                else
+                {
+                    state.AttemptCount++;
+                }
 
                 if (_maxAttemptsPerWindow != -1 && state.AttemptCount >= _maxAttemptsPerWindow)
                 {
