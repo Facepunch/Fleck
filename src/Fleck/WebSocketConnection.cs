@@ -281,6 +281,7 @@ namespace Fleck
                     DecrementPending(); // only BeginWrite could throw this exception type so we should undo the increment
                 }
 
+                bytes.Dispose();
                 HandleWriteError(e);
             }
         }
