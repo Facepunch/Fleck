@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Threading;
 
@@ -25,6 +26,9 @@ namespace Fleck
         private readonly Func<IWebSocketConnection, WebSocketHttpRequest, IHandler> _handlerFactory;
         private readonly Func<ArraySegment<byte>, WebSocketHttpRequest> _parseRequest;
         private int _pendingSendCount;
+
+        private static readonly ConcurrentBag<SendState> _sendStatePool = new ConcurrentBag<SendState>();
+        private static readonly AsyncCallback _onSendComplete = OnSendComplete;
         private byte[] _receiveBuffer;
         private int _receiveOffset;
         private bool _closing;
@@ -257,39 +261,18 @@ namespace Fleck
                     throw new InvalidOperationException("Too many pending sends on WebSocket connection. Disconnecting.");
                 }
 
-                // TODO: this allocates for the delegate - could probably avoid that with QueuedStream
-                Socket.Stream.BeginWrite(bytes.Data, 0, bytes.Length, result =>
+                // The completion callback is a cached static delegate and the per-send data (this connection, the buffer and the callback)
+                // is carried on a pooled state object passed as AsyncState, so no alloc on the send path
+                if (!_sendStatePool.TryTake(out var state))
                 {
-                    var instance = (WebSocketConnection)result.AsyncState;
-                    var success = false;
+                    state = new SendState();
+                }
 
-                    try
-                    {
-                        DecrementPending();
+                state.Connection = this;
+                state.Bytes = bytes;
+                state.Callback = callback;
 
-                        instance.Socket.Stream.EndWrite(result);
-                        FleckLog.Debug($"Sent {bytes.Length} bytes");
-
-                        success = true;
-                    }
-                    catch (Exception e)
-                    {
-                        instance.HandleWriteError(e);
-                    }
-                    finally
-                    {
-                        bytes.Dispose();
-                    }
-
-                    try
-                    {
-                        callback?.Invoke(instance, success);
-                    }
-                    catch (Exception e)
-                    {
-                        instance.OnError(e);
-                    }
-                }, this);
+                Socket.Stream.BeginWrite(bytes.Data, 0, bytes.Length, _onSendComplete, state);
             }
             catch (Exception e)
             {
@@ -298,19 +281,66 @@ namespace Fleck
                     DecrementPending(); // only BeginWrite could throw this exception type so we should undo the increment
                 }
 
+                bytes.Dispose();
                 HandleWriteError(e);
             }
+        }
 
-            return;
+        private static void OnSendComplete(IAsyncResult result)
+        {
+            var state = (SendState)result.AsyncState;
+            var instance = state.Connection;
+            var bytes = state.Bytes;
+            var callback = state.Callback;
 
-            void DecrementPending()
+            state.Connection = null;
+            state.Callback = null;
+            state.Bytes = default;
+            _sendStatePool.Add(state);
+
+            var success = false;
+
+            try
             {
-                if (Interlocked.Decrement(ref _pendingSendCount) < 0)
-                {
-                    FleckLog.Error("Pending send count on WebSocket connection has gone negative! Trying to fix it...");
-                    _pendingSendCount = 0;
-                }
+                instance.DecrementPending();
+
+                instance.Socket.Stream.EndWrite(result);
+                FleckLog.Debug($"Sent {bytes.Length} bytes");
+                success = true;
             }
+            catch (Exception e)
+            {
+                instance.HandleWriteError(e);
+            }
+            finally
+            {
+                bytes.Dispose();
+            }
+
+            try
+            {
+                callback?.Invoke(instance, success);
+            }
+            catch (Exception e)
+            {
+                instance.OnError(e);
+            }
+        }
+
+        private void DecrementPending()
+        {
+            if (Interlocked.Decrement(ref _pendingSendCount) < 0)
+            {
+                FleckLog.Error("Pending send count on WebSocket connection has gone negative! Trying to fix it...");
+                _pendingSendCount = 0;
+            }
+        }
+
+        private sealed class SendState
+        {
+            public WebSocketConnection Connection;
+            public MemoryBuffer Bytes;
+            public Action<WebSocketConnection, bool> Callback;
         }
 
         private void CloseSocket()
