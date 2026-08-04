@@ -131,33 +131,63 @@ namespace Fleck
 
             ListenForClients();
 
-            if (!allowed) // rate limit, don't initiate handshake, close socket immediately
-            {
-                clientSocket.Close();
-                return;
-            }
-
             WebSocketConnection connection = null;
 
-            connection = new WebSocketConnection(
-                clientSocket,
-                _config,
-                bytes => RequestParser.Parse(bytes, _scheme),
-                (c, r) => HandlerFactory.BuildHandler(r, c),
-                Limiter);
+            try
+            {
+                if (!allowed) // rate limit, don't initiate handshake, close socket immediately
+                {
+                    clientSocket.Close();
+                    return;
+                }
 
-            if (IsSecure)
-            {
-                FleckLog.Debug("Authenticating Secure Connection");
-                clientSocket
-                    .Authenticate(Certificate,
-                                  EnabledSslProtocols,
-                                  connection.StartReceiving,
-                                  e => FleckLog.Warn("Failed to Authenticate", e));
+                connection = new WebSocketConnection(
+                    clientSocket,
+                    _config,
+                    bytes => RequestParser.Parse(bytes, _scheme),
+                    (c, r) => HandlerFactory.BuildHandler(r, c),
+                    Limiter);
+
+                if (IsSecure)
+                {
+                    FleckLog.Debug("Authenticating Secure Connection");
+                    var secureConnection = connection;
+                    clientSocket
+                        .Authenticate(
+                            Certificate,
+                            EnabledSslProtocols,
+                            secureConnection.StartReceiving,
+                            e =>
+                            {
+                                FleckLog.Warn("Failed to Authenticate", e);
+
+                                // the handshake never started, so nothing else will release the slot or the socket
+                                secureConnection.ReleaseLimiterSlot();
+                                clientSocket.Close();
+                            });
+                }
+                else
+                {
+                    connection.StartReceiving();
+                }
             }
-            else
+            catch (Exception e)
             {
-                connection.StartReceiving();
+                if (allowed)
+                {
+                    if (connection != null)
+                    {
+                        connection.ReleaseLimiterSlot();
+                    }
+                    else
+                    {
+                        Limiter.Remove(clientSocket.RemoteIpAddress);
+                    }
+                }
+
+                clientSocket.Close();
+
+                FleckLog.Warn("Exception during socket start", e);
             }
         }
     }

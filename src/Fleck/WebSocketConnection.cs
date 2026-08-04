@@ -33,6 +33,7 @@ namespace Fleck
         private int _receiveOffset;
         private bool _closing;
         private bool _closed;
+        private int _limiterReleased;
         private readonly ConnectionLimiter _limiter;
 
         public WebSocketConnection(
@@ -343,11 +344,21 @@ namespace Fleck
             public Action<WebSocketConnection, bool> Callback;
         }
 
+        internal void ReleaseLimiterSlot()
+        {
+            if (Interlocked.Exchange(ref _limiterReleased, 1) != 0)
+            {
+                return;
+            }
+
+            // if keepalive has kicked in this may be a dead socket, in which case we'll want to fallback to connectioninfo
+            var address = Socket.RemoteIpAddress ?? ConnectionInfo?.ClientIpAddress;
+            _limiter.Remove(address);
+        }
+
         private void CloseSocket()
         {
-            // if keepalive has kicked in this may be a dead socket, in which case we'll want to fallback to connectioninfo
-            var address = Socket.RemoteIpAddress ?? ConnectionInfo.ClientIpAddress;
-            _limiter.Remove(address);
+            ReleaseLimiterSlot();
 
             _closing = true;
             OnClose();
