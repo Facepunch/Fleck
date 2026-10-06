@@ -34,6 +34,7 @@ namespace Fleck
         private bool _closing;
         private bool _closed;
         private int _limiterReleased;
+        private int _socketClosed;
         private readonly ConnectionLimiter _limiter;
 
         public WebSocketConnection(
@@ -243,6 +244,13 @@ namespace Fleck
 
         private void HandleWriteError(Exception e)
         {
+            if (e is ObjectDisposedException)
+            {
+                FleckLog.Warn("Swallowing ObjectDisposedException", e);
+                CloseSocket();
+                return;
+            }
+
             if (e is IOException)
                 FleckLog.Debug("Failed to send. Disconnecting.", e);
             else
@@ -358,6 +366,9 @@ namespace Fleck
 
         private void CloseSocket()
         {
+            if (Interlocked.Exchange(ref _socketClosed, 1) != 0)
+                return;
+
             ReleaseLimiterSlot();
 
             _closing = true;
