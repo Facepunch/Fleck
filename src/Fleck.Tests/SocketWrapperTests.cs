@@ -38,6 +38,32 @@ namespace Fleck.Tests
     }
 
     [TestFixture]
+    public class SocketWrapperResetTest
+    {
+        [Test]
+        public void ShouldKeepRemoteEndPointAfterPeerReset()
+        {
+            using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.IP);
+            listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            listener.Listen(10);
+
+            using var client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.IP);
+            client.Connect(listener.LocalEndPoint);
+            var clientEndPoint = (IPEndPoint)client.LocalEndPoint;
+
+            using var accepted = listener.Accept();
+            var wrapper = new SocketWrapper(accepted);
+
+            client.LingerState = new LingerOption(true, 0);
+            client.Close();
+            Thread.Sleep(100);
+
+            Assert.AreEqual(clientEndPoint.Address, wrapper.RemoteIpAddress);
+            Assert.AreEqual(clientEndPoint.Port, wrapper.RemotePort);
+        }
+    }
+
+    [TestFixture]
     public class SocketWrapperTests
     {
         private Socket _socket;

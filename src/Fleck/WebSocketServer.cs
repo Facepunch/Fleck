@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography.X509Certificates;
 using System.Security.Authentication;
+using System.Threading.Tasks;
 using Fleck.Helpers;
 
 namespace Fleck
@@ -26,6 +27,39 @@ namespace Fleck
 
             _locationIP = ParseIPAddress(uri);
             _scheme = uri.Scheme;
+
+            ListenerSocket = new SocketWrapper(CreateListenerSocket());
+            Limiter = new ConnectionLimiter();
+            Limiter.SetConnectionLimits(maxConnections, maxConnectionsPerIP);
+        }
+
+        public ISocket ListenerSocket { get; set; }
+        public string Location { get; }
+        public bool SupportDualStack { get; }
+        public int Port { get; private set; }
+        public X509Certificate2 Certificate { get; set; }
+        public SslProtocols EnabledSslProtocols { get; set; }
+        public bool RestartAfterListenError { get; set; } = true;
+        public int Backlog { get; set; }
+
+        public bool IsSecure => _scheme == "wss" && Certificate != null;
+
+        private const int MaxRestartDelaySeconds = 30;
+
+        private readonly object _listenerSync = new object();
+        private bool _disposed;
+
+        public void Dispose()
+        {
+            lock (_listenerSync)
+            {
+                _disposed = true;
+                ListenerSocket.Dispose();
+            }
+        }
+
+        private Socket CreateListenerSocket()
+        {
             var socket = new Socket(_locationIP.AddressFamily, SocketType.Stream, ProtocolType.IP);
 
             if (SupportDualStack)
@@ -37,25 +71,7 @@ namespace Fleck
                 }
             }
 
-            ListenerSocket = new SocketWrapper(socket);
-            Limiter = new ConnectionLimiter();
-            Limiter.SetConnectionLimits(maxConnections, maxConnectionsPerIP);
-        }
-
-        public ISocket ListenerSocket { get; set; }
-        public string Location { get; }
-        public bool SupportDualStack { get; }
-        public int Port { get; private set; }
-        public X509Certificate2 Certificate { get; set; }
-        public SslProtocols EnabledSslProtocols { get; set; }
-        public bool RestartAfterListenError { get; set; }
-        public int Backlog { get; set; }
-
-        public bool IsSecure => _scheme == "wss" && Certificate != null;
-
-        public void Dispose()
-        {
-            ListenerSocket.Dispose();
+            return socket;
         }
 
         private IPAddress ParseIPAddress(Uri uri)
@@ -93,8 +109,8 @@ namespace Fleck
                     return;
                 }
             }
-            ListenForClients();
             _config = config;
+            ListenForClients();
         }
 
         private void ListenForClients()
@@ -104,37 +120,67 @@ namespace Fleck
                 FleckLog.Error("Listener socket is closed", e);
                 if (RestartAfterListenError)
                 {
+                    RestartListener();
+                }
+            });
+        }
+
+        private async void RestartListener()
+        {
+            bool noDelay;
+            try
+            {
+                noDelay = ListenerSocket.NoDelay;
+            }
+            catch (Exception)
+            {
+                noDelay = false;
+            }
+
+            for (var attempt = 1; ; attempt++)
+            {
+                // Persistent errors (e.g. out of file descriptors) would otherwise restart in a tight loop
+                await Task.Delay(TimeSpan.FromSeconds(Math.Min(attempt, MaxRestartDelaySeconds)));
+
+                lock (_listenerSync)
+                {
+                    if (_disposed)
+                        return;
+
                     FleckLog.Info("Listener socket restarting");
                     try
                     {
                         ListenerSocket.Dispose();
-                        var socket = new Socket(_locationIP.AddressFamily, SocketType.Stream, ProtocolType.IP);
-                        ListenerSocket = new SocketWrapper(socket);
+                        ListenerSocket = new SocketWrapper(CreateListenerSocket());
+                        ListenerSocket.NoDelay = noDelay;
                         Start(_config);
                         FleckLog.Info("Listener socket restarted");
+                        return;
                     }
                     catch (Exception ex)
                     {
                         FleckLog.Error("Listener could not be restarted", ex);
                     }
                 }
-            });
+            }
         }
 
         private void OnClientConnect(ISocket clientSocket)
         {
             if (clientSocket == null) return; // socket closed
 
-            FleckLog.Debug($"Client connected from {clientSocket.RemoteIpAddress}:{clientSocket.RemotePort.ToString()}");
-
-            bool allowed = Limiter.TryAdd(clientSocket.RemoteIpAddress);
-
             ListenForClients();
 
+            // Exceptions escaping this method reach the listener's error handler and stop the accept loop
             WebSocketConnection connection = null;
+            bool allowed = false;
 
             try
             {
+                FleckLog.Debug($"Client connected from {clientSocket.RemoteIpAddress}:{clientSocket.RemotePort.ToString()}");
+
+                allowed = Limiter.TryAdd(clientSocket.RemoteIpAddress);
+
                 if (!allowed) // rate limit, don't initiate handshake, close socket immediately
                 {
                     clientSocket.Close();

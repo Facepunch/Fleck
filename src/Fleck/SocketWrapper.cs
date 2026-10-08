@@ -27,19 +27,13 @@ namespace Fleck
         private static readonly byte[] keepAliveValues;
     
         private readonly Socket _socket;
+        private readonly IPEndPoint _remoteEndPoint;
         private CancellationTokenSource _tokenSource;
         private TaskFactory _taskFactory;
 
-        public IPAddress RemoteIpAddress
-        {
-            get
-            {
-                var endpoint = _socket.RemoteEndPoint as IPEndPoint;
-                return endpoint?.Address;
-            }
-        }
+        public IPAddress RemoteIpAddress => _remoteEndPoint?.Address;
 
-        public int RemotePort => _socket.RemoteEndPoint is IPEndPoint endpoint ? endpoint.Port : -1;
+        public int RemotePort => _remoteEndPoint?.Port ?? -1;
 
         static SocketWrapper()
         {
@@ -59,28 +53,50 @@ namespace Fleck
             _tokenSource = new CancellationTokenSource();
             _taskFactory = new TaskFactory(_tokenSource.Token);
             _socket = socket;
+            _remoteEndPoint = TryGetRemoteEndPoint(socket);
             if (_socket.Connected)
                 Stream = new NetworkStream(_socket);
 
             // The tcp keepalive default values on most systems
             // are huge (~7200s). Set them to something more reasonable.
-            if (FleckRuntime.IsRunningOnWindows())
+            // Accepted sockets may already be dead, and throwing here would stop the accept loop.
+            try
             {
-                socket.IOControl(IOControlCode.KeepAliveValues, keepAliveValues, null);
+                if (FleckRuntime.IsRunningOnWindows())
+                {
+                    socket.IOControl(IOControlCode.KeepAliveValues, keepAliveValues, null);
+                }
+                else if (FleckRuntime.IsRunningOnLinux())
+                {
+                    socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                    int fd = (int)socket.Handle;
+
+                    // linux uses seconds, unlike milliseconds in windows - https://man7.org/linux/man-pages/man7/tcp.7.html
+                    int keepAlive = (int)KeepAliveInterval / 1000;
+                    int retryInterval = (int)RetryInterval / 1000;
+                    int probeCount = RetryProbes;
+
+                    setsockopt(fd, SOL_TCP, TCP_KEEPIDLE, ref keepAlive, sizeof(int));
+                    setsockopt(fd, SOL_TCP, TCP_KEEPINTVL, ref retryInterval, sizeof(int));
+                    setsockopt(fd, SOL_TCP, TCP_KEEPCNT, ref probeCount, sizeof(int));
+                }
             }
-            else if (FleckRuntime.IsRunningOnLinux())
+            catch (SocketException e)
             {
-                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-                int fd = (int)socket.Handle;
+                FleckLog.Debug("Failed to set keepalive values", e);
+            }
+        }
 
-                // linux uses seconds, unlike milliseconds in windows - https://man7.org/linux/man-pages/man7/tcp.7.html
-                int keepAlive = (int)KeepAliveInterval / 1000;
-                int retryInterval = (int)RetryInterval / 1000;
-                int probeCount = RetryProbes;
-
-                setsockopt(fd, SOL_TCP, TCP_KEEPIDLE, ref keepAlive, sizeof(int));
-                setsockopt(fd, SOL_TCP, TCP_KEEPINTVL, ref retryInterval, sizeof(int));
-                setsockopt(fd, SOL_TCP, TCP_KEEPCNT, ref probeCount, sizeof(int));
+        // Read once up front because Socket.RemoteEndPoint throws once the peer has dropped the connection
+        private static IPEndPoint TryGetRemoteEndPoint(Socket socket)
+        {
+            try
+            {
+                return socket.RemoteEndPoint as IPEndPoint;
+            }
+            catch (SocketException)
+            {
+                return null;
             }
         }
 

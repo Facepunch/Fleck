@@ -2,6 +2,7 @@ using System;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Authentication;
+using System.Threading;
 using Moq;
 using NUnit.Framework;
 using System.Security.Cryptography.X509Certificates;
@@ -44,6 +45,84 @@ namespace Fleck.Tests
 
             socketMock.Verify(s => s.Bind(It.Is<IPEndPoint>(i => i.Port == 8000)));
             socketMock.Verify(s => s.Accept(It.IsAny<Action<ISocket>>(), It.IsAny<Action<Exception>>()));
+        }
+
+        [Test]
+        public void ShouldKeepAcceptingWhenClientSetupThrows()
+        {
+            var clientMock = _repository.Create<ISocket>();
+            clientMock.Setup(s => s.RemoteIpAddress).Throws(new SocketException((int)SocketError.NotConnected));
+            clientMock.Setup(s => s.RemotePort).Throws(new SocketException((int)SocketError.NotConnected));
+
+            var acceptCount = 0;
+            Exception listenerError = null;
+            var listenerMock = _repository.Create<ISocket>();
+            listenerMock.Setup(s => s.LocalEndPoint).Returns(new IPEndPoint(IPAddress.Loopback, 8000));
+            listenerMock
+                .Setup(s => s.Accept(It.IsAny<Action<ISocket>>(), It.IsAny<Action<Exception>>()))
+                .Callback<Action<ISocket>, Action<Exception>>((callback, error) =>
+                {
+                    if (++acceptCount != 1)
+                        return;
+
+                    try
+                    {
+                        callback(clientMock.Object);
+                    }
+                    catch (Exception e)
+                    {
+                        listenerError = e;
+                    }
+                });
+
+            _server.ListenerSocket = listenerMock.Object;
+            _server.Start(connection => { });
+
+            Assert.IsNull(listenerError);
+            Assert.AreEqual(2, acceptCount);
+            clientMock.Verify(s => s.Close());
+        }
+
+        [Test]
+        public void ShouldRestartListenerAfterListenError()
+        {
+            Action<Exception> listenerError = null;
+            var listenerMock = _repository.Create<ISocket>();
+            listenerMock.Setup(s => s.LocalEndPoint).Returns(new IPEndPoint(IPAddress.Loopback, 0));
+            listenerMock
+                .Setup(s => s.Accept(It.IsAny<Action<ISocket>>(), It.IsAny<Action<Exception>>()))
+                .Callback<Action<ISocket>, Action<Exception>>((callback, error) => listenerError = error);
+
+            _server = new WebSocketServer("ws://127.0.0.1:0");
+            _server.ListenerSocket = listenerMock.Object;
+            _server.Start(connection => { });
+
+            listenerError(new SocketException((int)SocketError.ConnectionAborted));
+
+            Assert.That(() => _server.ListenerSocket, Is.Not.SameAs(listenerMock.Object).After(5000, 50));
+            listenerMock.Verify(s => s.Dispose());
+            Assert.DoesNotThrow(() => _ipV4Socket.Connect(_ipV4Address, _server.Port));
+        }
+
+        [Test]
+        public void ShouldNotRestartListenerAfterDispose()
+        {
+            Action<Exception> listenerError = null;
+            var listenerMock = _repository.Create<ISocket>();
+            listenerMock.Setup(s => s.LocalEndPoint).Returns(new IPEndPoint(IPAddress.Loopback, 0));
+            listenerMock
+                .Setup(s => s.Accept(It.IsAny<Action<ISocket>>(), It.IsAny<Action<Exception>>()))
+                .Callback<Action<ISocket>, Action<Exception>>((callback, error) => listenerError = error);
+
+            _server = new WebSocketServer("ws://127.0.0.1:0");
+            _server.ListenerSocket = listenerMock.Object;
+            _server.Start(connection => { });
+            _server.Dispose();
+
+            listenerError(new ObjectDisposedException("listener"));
+            Thread.Sleep(1500);
+
+            Assert.AreSame(listenerMock.Object, _server.ListenerSocket);
         }
 
         [Test]
