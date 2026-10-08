@@ -117,11 +117,12 @@ server.Start(socket =>
 Auto Restart After Listen Error
 ---
 
-Set `RestartAfterListenError` to `true` on the `WebSocketConnection`
+If the listener socket fails, the server recreates it with a backoff of up to 30 seconds between attempts.
+This is on by default, set `RestartAfterListenError` to `false` on the `WebSocketServer` to disable it.
 
 ```cs
 var server = new WebSocketServer("ws://0.0.0.0:8181");
-server.RestartAfterListenError = true;
+server.RestartAfterListenError = false;
 server.Start(socket =>
 {
   //...use as normal
