@@ -4,7 +4,7 @@ namespace Fleck
 {
     public class HandlerFactory
     {
-        public static IHandler BuildHandler(WebSocketHttpRequest request, IWebSocketConnection connection)
+        public static IHandler BuildHandler(WebSocketHttpRequest request, IWebSocketConnection connection, int maxMessageSize = WebSocketServer.DefaultMaxMessageSize)
         {
             var version = GetVersion(request);
             
@@ -13,7 +13,7 @@ namespace Fleck
                 case "7":
                 case "8":
                 case "13":
-                    return new Hybi13Handler(request, connection);
+                    return new Hybi13Handler(request, connection, maxMessageSize);
             }
             
             throw new WebSocketException(WebSocketStatusCodes.ProtocolError);

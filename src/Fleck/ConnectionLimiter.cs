@@ -19,6 +19,10 @@ namespace Fleck
         private int _maxAttemptsPerWindow = 5;
         private TimeSpan _attemptWindow = TimeSpan.FromSeconds(5);
 
+        // how often idle entries are swept out, so IPs that never come back (e.g. scanners) don't accumulate forever
+        private static readonly TimeSpan PruneInterval = TimeSpan.FromMinutes(1);
+        private DateTime _lastPrune = DateTime.UtcNow;
+
         private class ClientState
         {
             public int ActiveConnections;
@@ -32,6 +36,18 @@ namespace Fleck
             _maxConnectionsPerIP = maxConnectionsPerIP;
         }
 
+        /// <summary>
+        /// Limits how many connection attempts each IP can make within a window. -1 disables the limit.
+        /// </summary>
+        public void SetAttemptLimits(int maxAttemptsPerWindow, TimeSpan attemptWindow)
+        {
+            lock (_sync)
+            {
+                _maxAttemptsPerWindow = maxAttemptsPerWindow;
+                _attemptWindow = attemptWindow;
+            }
+        }
+
         public bool TryAdd(IPAddress address)
         {
             if (address == null)
@@ -41,26 +57,32 @@ namespace Fleck
 
             lock (_sync)
             {
+                var now = DateTime.UtcNow;
+
+                if (now - _lastPrune > PruneInterval)
+                {
+                    Prune(now);
+                }
+
                 if (_maxConnections != -1 && _overallCount >= _maxConnections)
                 {
                     return false;
                 }
 
+                // the first attempt in a window counts as 0, so _maxAttemptsPerWindow attempts are allowed in each window,
+                // whether this IP is new or its previous window has passed
                 if (!_clients.TryGetValue(address, out var state))
                 {
                     state = new ClientState
                     {
                         ActiveConnections = 0,
                         AttemptCount = 0,
-                        WindowStart = DateTime.UtcNow
+                        WindowStart = now
                     };
 
                     _clients[address] = state;
                 }
-
-                var now = DateTime.UtcNow;
-
-                if (now - state.WindowStart > _attemptWindow)
+                else if (now - state.WindowStart > _attemptWindow)
                 {
                     state.WindowStart = now;
                     state.AttemptCount = 0;
@@ -111,7 +133,7 @@ namespace Fleck
                     _overallCount--;
                 }
 
-                if (state.ActiveConnections == 0 && state.AttemptCount == 0)
+                if (IsIdle(state, DateTime.UtcNow))
                 {
                     _clients.Remove(address);
                 }
@@ -123,6 +145,52 @@ namespace Fleck
             lock (_sync)
             {
                 _overallCount--;
+            }
+        }
+
+        // nothing to remember once there are no connections and the attempt window has passed, since the next attempt
+        // would start a fresh window anyway. the entry has to be kept until then even with no connections, or connecting
+        // and disconnecting in a loop would never be limited
+        private bool IsIdle(ClientState state, DateTime now)
+        {
+            return state.ActiveConnections == 0 && now - state.WindowStart > _attemptWindow;
+        }
+
+        internal void Prune(DateTime now)
+        {
+            lock (_sync)
+            {
+                _lastPrune = now;
+
+                List<IPAddress> idle = null;
+                foreach (var pair in _clients)
+                {
+                    if (IsIdle(pair.Value, now))
+                    {
+                        (idle ?? (idle = new List<IPAddress>())).Add(pair.Key);
+                    }
+                }
+
+                if (idle == null)
+                {
+                    return;
+                }
+
+                foreach (var address in idle)
+                {
+                    _clients.Remove(address);
+                }
+            }
+        }
+
+        internal int TrackedClientCount
+        {
+            get
+            {
+                lock (_sync)
+                {
+                    return _clients.Count;
+                }
             }
         }
 

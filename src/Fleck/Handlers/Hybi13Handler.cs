@@ -14,25 +14,39 @@ namespace Fleck.Handlers
         private static readonly SHA1 SHA1 = SHA1.Create();
         private static readonly ThreadLocal<StringBuilder> StringBuilder = new ThreadLocal<StringBuilder>(() => new StringBuilder(1024));
 
+        // buffers start small and grow on demand, so connections that never receive big messages don't hold big buffers
+        private const int InitialBufferSize = 64 * 1024;
+
+        // the read buffer holds a whole frame plus its header and the start of the next read
+        private const int ReadBufferSlack = 64 * 1024;
+
         private readonly WebSocketHttpRequest _request;
         private readonly IWebSocketConnection _connection;
+        private readonly int _maxMessageSize;
+        private readonly int _maxDataSize;
         private byte[] _data;
         private int _dataLen;
 
         private FrameType? _frameType;
         private byte[] _message;
         private int _messageLen;
+        private bool _closeReceived;
 
-        public Hybi13Handler(WebSocketHttpRequest request, IWebSocketConnection connection)
+        public Hybi13Handler(WebSocketHttpRequest request, IWebSocketConnection connection, int maxMessageSize = WebSocketServer.DefaultMaxMessageSize)
         {
             _request = request;
             _connection = connection;
+            if (maxMessageSize <= 0)
+                throw new ArgumentOutOfRangeException(nameof(maxMessageSize), "must be positive");
 
-            _data = ArrayPool<byte>.Shared.Rent(1 * 1024 * 1024); // 1 MB read buffer
+            _maxMessageSize = Math.Max(maxMessageSize, WebSocketServer.MinimumMaxMessageSize);
+            _maxDataSize = (int)Math.Min((long)_maxMessageSize + ReadBufferSlack, int.MaxValue); // a limit near int.MaxValue mustn't overflow
+
+            _data = ArrayPool<byte>.Shared.Rent(InitialBufferSize);
             _dataLen = 0;
 
             _frameType = null;
-            _message = ArrayPool<byte>.Shared.Rent(1 * 1024 * 1024); // 1 MB message length
+            _message = ArrayPool<byte>.Shared.Rent(InitialBufferSize);
             _messageLen = 0;
         }
 
@@ -51,10 +65,32 @@ namespace Fleck.Handlers
             }
         }
 
+        // moves to a pooled buffer big enough for required, keeping the used bytes; only buffers past the pool's largest size allocate
+        private static void Grow(ref byte[] buffer, int used, int required, int limit)
+        {
+            if (required > limit)
+                throw new WebSocketException(WebSocketStatusCodes.MessageTooBig);
+
+            var bigger = ArrayPool<byte>.Shared.Rent(Math.Min(Math.Max(required, buffer.Length * 2), limit));
+            Buffer.BlockCopy(buffer, 0, bigger, 0, used);
+            ArrayPool<byte>.Shared.Return(buffer);
+            buffer = bigger;
+        }
+
         public void Receive(Span<byte> newData)
         {
-            if (newData.Length + _dataLen >= _data.Length)
+            // Ignore further data after either endpoint starts closing.
+            if (_closeReceived || !_connection.IsAvailable)
+                return;
+
+            // checked against the limit itself, not just when growing, since the buffer can already be bigger than the limit
+            // (it starts at InitialBufferSize and the pool rounds sizes up)
+            var required = _dataLen + newData.Length;
+            if (required > _maxDataSize)
                 throw new WebSocketException(WebSocketStatusCodes.MessageTooBig);
+
+            if (required > _data.Length)
+                Grow(ref _data, _dataLen, required, _maxDataSize);
 
             var dest = new Span<byte>(_data, _dataLen, newData.Length);
             newData.CopyTo(dest);
@@ -99,6 +135,11 @@ namespace Fleck.Handlers
             return FrameData(bytes, FrameType.Binary);
         }
 
+        public MemoryBuffer FrameBinary(ReadOnlySpan<byte> prefix, MemoryBuffer bytes)
+        {
+            return FrameData(bytes, FrameType.Binary, prefix);
+        }
+
         public MemoryBuffer FramePing(MemoryBuffer bytes)
         {
             return FrameData(bytes, FrameType.Ping);
@@ -116,35 +157,40 @@ namespace Fleck.Handlers
             return FrameData(codeSpan, FrameType.Close);
         }
 
-        private static MemoryBuffer FrameData(MemoryBuffer payload, FrameType frameType)
+        private static MemoryBuffer FrameData(MemoryBuffer payload, FrameType frameType, ReadOnlySpan<byte> prefix = default)
         {
-            var framed = FrameData((Span<byte>)payload, frameType);
+            var framed = FrameData((Span<byte>)payload, frameType, prefix);
             payload.Dispose();
             return framed;
         }
 
-        private static MemoryBuffer FrameData(Span<byte> payload, FrameType frameType)
+        // the prefix is written straight after the frame header, as the start of the frame's payload
+        private static MemoryBuffer FrameData(Span<byte> payload, FrameType frameType, ReadOnlySpan<byte> prefix = default)
         {
-            var data = ArrayPool<byte>.Shared.Rent(payload.Length + 16);
+            var length = prefix.Length + payload.Length;
+            var data = ArrayPool<byte>.Shared.Rent(length + 16);
             var writer = new SpanWriter(data);
 
             byte op = (byte)((byte)frameType + 128);
             writer.Write(op);
 
-            if (payload.Length > ushort.MaxValue)
+            if (length > ushort.MaxValue)
             {
                 writer.Write<byte>(127);
-                writer.Write((ulong)payload.Length);
+                writer.Write((ulong)length);
             }
-            else if (payload.Length > 125)
+            else if (length > 125)
             {
                 writer.Write<byte>(126);
-                writer.Write((ushort)payload.Length);
+                writer.Write((ushort)length);
             }
             else
             {
-                writer.Write((byte)payload.Length);
+                writer.Write((byte)length);
             }
+
+            if (prefix.Length > 0)
+                writer.Write(prefix);
 
             if (payload.Length > 0)
                 writer.Write(payload);
@@ -154,7 +200,8 @@ namespace Fleck.Handlers
 
         private void ReceiveData()
         {
-            while (_dataLen >= 2)
+            // Application callbacks can close locally while more frames remain in the same read.
+            while (_dataLen >= 2 && !_closeReceived && _connection.IsAvailable)
             {
                 FleckLog.Debug("Trying to read a packet");
 
@@ -165,10 +212,14 @@ namespace Fleck.Handlers
                 var length = (_data[1] & 127);
 
 
+                var isControl = frameType >= FrameType.Close;
+
                 if (!isMasked
                     || !frameType.IsDefined()
                     || reservedBits != 0 // Must be zero per spec 5.2
-                    || (frameType == FrameType.Continuation && !_frameType.HasValue))
+                    || (frameType == FrameType.Continuation && !_frameType.HasValue)
+                    || (!isControl && frameType != FrameType.Continuation && _frameType.HasValue) // a new message mid-fragmented message
+                    || (isControl && (!isFinal || length > 125))) // control frames can't be fragmented and are at most 125 bytes (5.5)
                     throw new WebSocketException(WebSocketStatusCodes.ProtocolError);
 
                 var index = 2;
@@ -195,6 +246,10 @@ namespace Fleck.Handlers
 
                 FleckLog.Debug($"Expecting {payloadLength} byte payload");
 
+                // reject from the header rather than buffering towards it. negative when a 64-bit length didn't fit in an int
+                if (payloadLength < 0 || payloadLength > _maxMessageSize)
+                    throw new WebSocketException(WebSocketStatusCodes.MessageTooBig);
+
                 if (_dataLen < index + 4)
                     return; //Not complete
 
@@ -210,8 +265,24 @@ namespace Fleck.Handlers
                     payloadData[i] = (byte)(payloadData[i] ^ maskBytes[i % 4]);
                 }
 
-                if (_messageLen + payloadLength > _message.Length)
+                if (isControl)
+                {
+                    // handled on its own, straight from the read buffer: control frames can arrive between the fragments of
+                    // a message (5.4), which has to carry on unaffected
+                    ProcessFrame(frameType, new ArraySegment<byte>(_data, index, payloadLength));
+
+                    var controlBytesUsed = index + payloadLength;
+                    Buffer.BlockCopy(_data, controlBytesUsed, _data, 0, _dataLen - controlBytesUsed);
+                    _dataLen -= controlBytesUsed;
+                    continue;
+                }
+
+                var messageLength = _messageLen + payloadLength;
+                if (messageLength > _maxMessageSize)
                     throw new WebSocketException(WebSocketStatusCodes.MessageTooBig);
+
+                if (messageLength > _message.Length)
+                    Grow(ref _message, _messageLen, messageLength, _maxMessageSize);
 
                 var messageDest = new Span<byte>(_message, _messageLen, payloadLength);
                 payloadData.CopyTo(messageDest);
@@ -242,14 +313,18 @@ namespace Fleck.Handlers
                     if (buffer.Count == 1 || buffer.Count > 125)
                         throw new WebSocketException(WebSocketStatusCodes.ProtocolError);
 
+                    // echo the client's status code back, as RFC 6455 5.5.1 asks. an empty close has none, so reply normally
+                    var closeCode = WebSocketStatusCodes.NormalClosure;
                     if (buffer.Count >= 2)
                     {
-                        var closeCode = (ushort)new Span<byte>(buffer.Array, 0, 2).ToLittleEndianInt();
+                        closeCode = (ushort)new Span<byte>(buffer.Array, buffer.Offset, 2).ToLittleEndianInt();
                         if (!WebSocketStatusCodes.ValidCloseCodes.Contains(closeCode) && (closeCode < 3000 || closeCode > 4999))
                             throw new WebSocketException(WebSocketStatusCodes.ProtocolError);
                     }
 
-                    _connection.OnClose?.Invoke();
+                    // answer the close and shut the socket, which raises OnClose once the connection is actually closed
+                    _closeReceived = true;
+                    _connection.Close(closeCode);
                     break;
                 case FrameType.Binary:
                     _connection.OnBinary?.Invoke(buffer);

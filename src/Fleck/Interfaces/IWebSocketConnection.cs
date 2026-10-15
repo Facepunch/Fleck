@@ -15,9 +15,11 @@ namespace Fleck
         Action<Exception> OnError { get; set; }
         void Send(string message);
         void Send(MemoryBuffer message);
+        void Send(ReadOnlySpan<byte> prefix, MemoryBuffer message);
         void SendPing(MemoryBuffer message);
         void SendPong(MemoryBuffer message);
         void Close();
+        void Close(ushort code);
         IWebSocketConnectionInfo ConnectionInfo { get; }
         bool IsAvailable { get; }
     }

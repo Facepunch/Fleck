@@ -14,6 +14,9 @@ namespace Fleck
         private readonly IPAddress _locationIP;
         private Action<IWebSocketConnection> _config;
 
+        public const int DefaultMaxMessageSize = 1024 * 1024;
+        public const int MinimumMaxMessageSize = 1024;
+
         public readonly ConnectionLimiter Limiter;
 
         public WebSocketServer(string location, bool supportDualStack = true, int backlog = 100, int maxConnections = 500, int maxConnectionsPerIP = 5)
@@ -40,7 +43,25 @@ namespace Fleck
         public X509Certificate2 Certificate { get; set; }
         public SslProtocols EnabledSslProtocols { get; set; }
         public bool RestartAfterListenError { get; set; } = true;
+
+        // how long a client has to complete its handshake (including TLS) before it's disconnected. zero or less turns it off
+        public TimeSpan HandshakeTimeout { get; set; } = TimeSpan.FromSeconds(10);
         public int Backlog { get; set; }
+
+        // largest message a connection can receive; positive values below MinimumMaxMessageSize are clamped to it
+        public int MaxMessageSize
+        {
+            get => _maxMessageSize;
+            set
+            {
+                if (value <= 0)
+                    throw new ArgumentOutOfRangeException(nameof(value), "MaxMessageSize must be positive");
+
+                _maxMessageSize = Math.Max(value, MinimumMaxMessageSize);
+            }
+        }
+
+        private int _maxMessageSize = DefaultMaxMessageSize;
 
         public bool IsSecure => _scheme == "wss" && Certificate != null;
 
@@ -191,8 +212,9 @@ namespace Fleck
                     clientSocket,
                     _config,
                     bytes => RequestParser.Parse(bytes, _scheme),
-                    (c, r) => HandlerFactory.BuildHandler(r, c),
-                    Limiter);
+                    (c, r) => HandlerFactory.BuildHandler(r, c, MaxMessageSize),
+                    Limiter,
+                    HandshakeTimeout);
 
                 if (IsSecure)
                 {
