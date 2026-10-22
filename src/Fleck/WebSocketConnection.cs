@@ -245,6 +245,34 @@ namespace Fleck
             return true;
         }
 
+        // for the client: the handshake has already been done on the socket, so go straight to open. leftover is anything the
+        // server sent after its handshake response, which belongs to the first frames
+        internal void StartClient(IHandler handler, IWebSocketConnectionInfo info, ArraySegment<byte> leftover)
+        {
+            ConnectionInfo = info;
+            Handler = handler;
+            _receiveHandler = handler;
+            _receiveBuffer = ArrayPool<byte>.Shared.Rent(ReadSize);
+
+            Volatile.Write(ref _handshakeState, HandshakeComplete);
+            Volatile.Write(ref _handshakeQueued, 1);
+
+            try
+            {
+                OnOpen();
+
+                if (leftover.Count > 0 && IsAvailable)
+                    handler.Receive(new Span<byte>(leftover.Array, leftover.Offset, leftover.Count));
+            }
+            catch (Exception e)
+            {
+                HandleReadErrorSafely(e);
+                return;
+            }
+
+            Receive(0);
+        }
+
         private void OnHandshakeTimeout()
         {
             try
@@ -808,7 +836,7 @@ namespace Fleck
 
             // if keepalive has kicked in this may be a dead socket, in which case we'll want to fallback to connectioninfo
             var address = Socket.RemoteIpAddress ?? ConnectionInfo?.ClientIpAddress;
-            _limiter.Remove(address);
+            _limiter?.Remove(address);
         }
 
         private void CloseSocket()

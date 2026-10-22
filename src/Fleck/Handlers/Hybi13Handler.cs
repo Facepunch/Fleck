@@ -12,6 +12,7 @@ namespace Fleck.Handlers
         private const string WebSocketResponseGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
         private static readonly Encoding UTF8 = new UTF8Encoding(false, true);
         private static readonly SHA1 SHA1 = SHA1.Create();
+        private static readonly RandomNumberGenerator MaskGenerator = RandomNumberGenerator.Create();
         private static readonly ThreadLocal<StringBuilder> StringBuilder = new ThreadLocal<StringBuilder>(() => new StringBuilder(1024));
 
         // buffers start small and grow on demand, so connections that never receive big messages don't hold big buffers
@@ -31,11 +32,13 @@ namespace Fleck.Handlers
         private byte[] _message;
         private int _messageLen;
         private bool _closeReceived;
+        private readonly bool _isClient; // clients mask what they send and expect unmasked frames back (RFC 6455 5.1)
 
-        public Hybi13Handler(WebSocketHttpRequest request, IWebSocketConnection connection, int maxMessageSize = WebSocketServer.DefaultMaxMessageSize)
+        public Hybi13Handler(WebSocketHttpRequest request, IWebSocketConnection connection, int maxMessageSize = WebSocketServer.DefaultMaxMessageSize, bool isClient = false)
         {
             _request = request;
             _connection = connection;
+            _isClient = isClient;
             if (maxMessageSize <= 0)
                 throw new ArgumentOutOfRangeException(nameof(maxMessageSize), "must be positive");
 
@@ -101,6 +104,9 @@ namespace Fleck.Handlers
 
         public MemoryBuffer CreateHandshake()
         {
+            if (_isClient)
+                throw new InvalidOperationException("A client handler doesn't create a handshake response");
+
             FleckLog.Debug("Building Hybi-14 Response");
 
             var builder = StringBuilder.Value;
@@ -157,7 +163,7 @@ namespace Fleck.Handlers
             return FrameData(codeSpan, FrameType.Close);
         }
 
-        private static MemoryBuffer FrameData(MemoryBuffer payload, FrameType frameType, ReadOnlySpan<byte> prefix = default)
+        private MemoryBuffer FrameData(MemoryBuffer payload, FrameType frameType, ReadOnlySpan<byte> prefix = default)
         {
             var framed = FrameData((Span<byte>)payload, frameType, prefix);
             payload.Dispose();
@@ -165,7 +171,7 @@ namespace Fleck.Handlers
         }
 
         // the prefix is written straight after the frame header, as the start of the frame's payload
-        private static MemoryBuffer FrameData(Span<byte> payload, FrameType frameType, ReadOnlySpan<byte> prefix = default)
+        private MemoryBuffer FrameData(Span<byte> payload, FrameType frameType, ReadOnlySpan<byte> prefix = default)
         {
             var length = prefix.Length + payload.Length;
             var data = ArrayPool<byte>.Shared.Rent(length + 16);
@@ -174,26 +180,47 @@ namespace Fleck.Handlers
             byte op = (byte)((byte)frameType + 128);
             writer.Write(op);
 
+            var maskBit = _isClient ? (byte)128 : (byte)0;
+
             if (length > ushort.MaxValue)
             {
-                writer.Write<byte>(127);
+                writer.Write<byte>((byte)(127 | maskBit));
                 writer.Write((ulong)length);
             }
             else if (length > 125)
             {
-                writer.Write<byte>(126);
+                writer.Write<byte>((byte)(126 | maskBit));
                 writer.Write((ushort)length);
             }
             else
             {
-                writer.Write((byte)length);
+                writer.Write((byte)(length | maskBit));
             }
 
+            if (!_isClient)
+            {
+                if (prefix.Length > 0)
+                    writer.Write(prefix);
+
+                if (payload.Length > 0)
+                    writer.Write(payload);
+
+                return new MemoryBuffer(data, writer.Length);
+            }
+
+            var mask = new byte[4];
+            MaskGenerator.GetBytes(mask);
+            writer.Write((ReadOnlySpan<byte>)mask);
+
+            var payloadStart = writer.Length;
             if (prefix.Length > 0)
                 writer.Write(prefix);
 
             if (payload.Length > 0)
                 writer.Write(payload);
+
+            for (var i = 0; i < length; i++)
+                data[payloadStart + i] ^= mask[i % 4];
 
             return new MemoryBuffer(data, writer.Length);
         }
@@ -214,7 +241,7 @@ namespace Fleck.Handlers
 
                 var isControl = frameType >= FrameType.Close;
 
-                if (!isMasked
+                if (isMasked == _isClient // servers need masked frames, clients unmasked ones (5.1)
                     || !frameType.IsDefined()
                     || reservedBits != 0 // Must be zero per spec 5.2
                     || (frameType == FrameType.Continuation && !_frameType.HasValue)
@@ -250,19 +277,23 @@ namespace Fleck.Handlers
                 if (payloadLength < 0 || payloadLength > _maxMessageSize)
                     throw new WebSocketException(WebSocketStatusCodes.MessageTooBig);
 
-                if (_dataLen < index + 4)
+                var maskLength = isMasked ? 4 : 0;
+                if (_dataLen < index + maskLength)
                     return; //Not complete
 
-                var maskBytes = new Span<byte>(_data, index, 4);
-                index += 4;
+                var maskBytes = new Span<byte>(_data, index, maskLength);
+                index += maskLength;
 
                 if (_dataLen < index + payloadLength)
                     return; //Not complete
 
                 var payloadData = new Span<byte>(_data, index, payloadLength);
-                for (var i = 0; i < payloadLength; i++)
+                if (isMasked)
                 {
-                    payloadData[i] = (byte)(payloadData[i] ^ maskBytes[i % 4]);
+                    for (var i = 0; i < payloadLength; i++)
+                    {
+                        payloadData[i] = (byte)(payloadData[i] ^ maskBytes[i % 4]);
+                    }
                 }
 
                 if (isControl)
