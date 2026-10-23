@@ -162,7 +162,7 @@ namespace Fleck.Tests
         {
             var error = new TaskCompletionSource<Exception>();
             var client = new WebSocketClient(Url);
-            var connection = await client.Connect(socket => socket.OnError = (e) => error.SetException(e));
+            var connection = await client.Connect(socket => socket.OnError = (e) => error.SetException(e), true);
             connection.MaxPendingSends = 1;
             Parallel.For(0, 1000, (i) =>
             {

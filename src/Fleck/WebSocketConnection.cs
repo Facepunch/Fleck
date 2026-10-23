@@ -539,25 +539,25 @@ namespace Fleck
 
         private void SendBytes(MemoryBuffer bytes, Action<WebSocketConnection, bool> callback = null, bool pump = true)
         {
-            if (Interlocked.Increment(ref _pendingSendCount) > MaxPendingSends && MaxPendingSends > 0)
-            {
-                DecrementPending(); // never queued
-                bytes.Dispose();
-
-                try
-                {
-                    HandleWriteError(new InvalidOperationException("Too many pending sends on WebSocket connection. Disconnecting."));
-                }
-                catch (Exception e)
-                {
-                    LogUnexpected("Error handling a failed send", e); // keep Send from throwing
-                }
-
-                return;
-            }
-
             if (_isAsync)
             {
+                if (Interlocked.Increment(ref _pendingSendCount) > MaxPendingSends && MaxPendingSends > 0)
+                {
+                    DecrementPending(); // never queued
+                    bytes.Dispose();
+
+                    try
+                    {
+                        HandleWriteError(new InvalidOperationException("Too many pending sends on WebSocket connection. Disconnecting."));
+                    }
+                    catch (Exception e)
+                    {
+                        LogUnexpected("Error handling a failed send", e); // keep Send from throwing
+                    }
+
+                    return;
+                }
+
                 // The completion callback is a cached static delegate and the per-send data (this connection, the buffer and the callback)
                 // is carried on a pooled state object passed as AsyncState, so no alloc on the send path
                 if (!_sendStatePool.TryTake(out var state))
@@ -595,7 +595,6 @@ namespace Fleck
                 {
                     LogUnexpected("Error releasing a sent buffer", e);
                 }
-                DecrementPending();
 
                 try
                 {
