@@ -25,6 +25,7 @@ namespace Fleck
         public Action<Exception> OnError { get; set; }
         public IWebSocketConnectionInfo ConnectionInfo { get; private set; }
         public bool IsAvailable => !_closing && !_closed && Socket.Connected;
+        public int MaxPendingSends { get; set; } = 2048;
 
         private readonly Action<IWebSocketConnection> _initialize;
         private readonly Func<IWebSocketConnection, WebSocketHttpRequest, IHandler> _handlerFactory;
@@ -55,6 +56,7 @@ namespace Fleck
         private Timer _handshakeTimer;
         private static readonly TimeSpan MaxTimerDueTime = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
         private readonly ConnectionLimiter _limiter;
+        private readonly bool _isAsync;
 
         public WebSocketConnection(
             ISocket socket,
@@ -62,7 +64,8 @@ namespace Fleck
             Func<ArraySegment<byte>, WebSocketHttpRequest> parseRequest,
             Func<IWebSocketConnection, WebSocketHttpRequest, IHandler> handlerFactory,
             ConnectionLimiter limiter,
-            TimeSpan? handshakeTimeout = null)
+            TimeSpan? handshakeTimeout = null,
+            bool isAsync = true)
         {
             Socket = socket;
             OnOpen = () => { };
@@ -76,6 +79,7 @@ namespace Fleck
             _handlerFactory = handlerFactory;
             _parseRequest = parseRequest;
             _limiter = limiter;
+            _isAsync = isAsync;
 
             // a client that never finishes its handshake (e.g. sending it a byte at a time) would otherwise hold its connection
             // and limiter slot forever. started here so it also covers a slow TLS negotiation
@@ -221,6 +225,11 @@ namespace Fleck
             {
                 try
                 {
+                    if(!instance._isAsync)
+                    {
+                        Volatile.Write(ref _handshakeQueued, 1);
+                    }
+
                     // Completion and timeout must choose one outcome before either raises application events.
                     if (success && Interlocked.CompareExchange(ref instance._handshakeState, HandshakeComplete, HandshakePending) == HandshakePending)
                     {
@@ -239,10 +248,47 @@ namespace Fleck
                 }
             }, pump: false);
 
-            Volatile.Write(ref _handshakeQueued, 1);
-            PumpSends();
+            if (_isAsync)
+            {
+                Volatile.Write(ref _handshakeQueued, 1);
+                PumpSends();
+            }
 
             return true;
+        }
+
+        // for the client: the handshake has already been done on the socket, so go straight to open. leftover is anything the
+        // server sent after its handshake response, which belongs to the first frames
+        internal void StartClient(IHandler handler, IWebSocketConnectionInfo info, ArraySegment<byte> leftover)
+        {
+            if (Volatile.Read(ref _socketClosed) != 0)
+             {
+                 handler.Dispose();
+                 return;
+             }
+
+            ConnectionInfo = info;
+            Handler = handler;
+            _receiveHandler = handler;
+            _receiveBuffer = ArrayPool<byte>.Shared.Rent(ReadSize);
+
+            Volatile.Write(ref _handshakeState, HandshakeComplete);
+            Volatile.Write(ref _handshakeQueued, 1);
+
+            try
+            {
+                OnOpen();
+
+                if (leftover.Count > 0 && IsAvailable)
+                    handler.Receive(new Span<byte>(leftover.Array, leftover.Offset, leftover.Count));
+            }
+            catch (Exception e)
+            {
+                HandleReadErrorSafely(e);
+                return;
+            }
+
+            Receive(0);
         }
 
         private void OnHandshakeTimeout()
@@ -507,38 +553,72 @@ namespace Fleck
 
         private void SendBytes(MemoryBuffer bytes, Action<WebSocketConnection, bool> callback = null, bool pump = true)
         {
-            if (Interlocked.Increment(ref _pendingSendCount) > 2048)
+            if (_isAsync)
             {
-                DecrementPending(); // never queued
-                bytes.Dispose();
+                if (Interlocked.Increment(ref _pendingSendCount) > MaxPendingSends && MaxPendingSends > 0)
+                {
+                    DecrementPending(); // never queued
+                    bytes.Dispose();
+
+                    try
+                    {
+                        HandleWriteError(new InvalidOperationException("Too many pending sends on WebSocket connection. Disconnecting."));
+                    }
+                    catch (Exception e)
+                    {
+                        LogUnexpected("Error handling a failed send", e); // keep Send from throwing
+                    }
+
+                    return;
+                }
+
+                // The completion callback is a cached static delegate and the per-send data (this connection, the buffer and the callback)
+                // is carried on a pooled state object passed as AsyncState, so no alloc on the send path
+                if (!_sendStatePool.TryTake(out var state))
+                {
+                    state = new SendState();
+                }
+
+                state.Connection = this;
+                state.Bytes = bytes;
+                state.Callback = callback;
+
+                _sendQueue.Enqueue(state);
+
+                if (pump)
+                    PumpSends();
+            }
+            else
+            {
+                bool success = true;
+                try
+                {
+                    Socket.Stream.Write(bytes.Data, 0, bytes.Length);
+                }
+                catch(Exception e)
+                {
+                    HandleWriteError(e);
+                    success = false;
+                }
 
                 try
                 {
-                    HandleWriteError(new InvalidOperationException("Too many pending sends on WebSocket connection. Disconnecting."));
+                    bytes.Dispose();
                 }
-                catch (Exception e)
+                catch(Exception e)
                 {
-                    LogUnexpected("Error handling a failed send", e); // keep Send from throwing
+                    LogUnexpected("Error releasing a sent buffer", e);
                 }
 
-                return;
+                try
+                {
+                    callback?.Invoke(this, success);
+                }
+                catch(Exception e)
+                {
+                    RaiseError(e);
+                }
             }
-
-            // The completion callback is a cached static delegate and the per-send data (this connection, the buffer and the callback)
-            // is carried on a pooled state object passed as AsyncState, so no alloc on the send path
-            if (!_sendStatePool.TryTake(out var state))
-            {
-                state = new SendState();
-            }
-
-            state.Connection = this;
-            state.Bytes = bytes;
-            state.Callback = callback;
-
-            _sendQueue.Enqueue(state);
-
-            if (pump)
-                PumpSends();
         }
 
         // Writes go out one at a time: a stream doesn't support overlapping writes (NetworkStream can split one into several
@@ -808,7 +888,7 @@ namespace Fleck
 
             // if keepalive has kicked in this may be a dead socket, in which case we'll want to fallback to connectioninfo
             var address = Socket.RemoteIpAddress ?? ConnectionInfo?.ClientIpAddress;
-            _limiter.Remove(address);
+            _limiter?.Remove(address);
         }
 
         private void CloseSocket()

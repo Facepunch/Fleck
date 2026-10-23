@@ -115,6 +115,21 @@ namespace Fleck
             return task;
         }
 
+        // client side TLS. left unqueued so the handshake can use plain stream calls, see EnableQueuedWrites
+        internal async Task AuthenticateAsClient(string targetHost, SslProtocols enabledSslProtocols)
+        {
+            var ssl = new SslStream(Stream, false);
+            Stream = ssl;
+            await ssl.AuthenticateAsClientAsync(targetHost, null, enabledSslProtocols, true).ConfigureAwait(false);
+        }
+
+        // SslStream doesn't allow overlapping writes, which the connection can do
+        internal void EnableQueuedWrites()
+        {
+            if (Stream is SslStream)
+                Stream = new QueuedStream(Stream);
+        }
+
         public void Listen(int backlog)
         {
             _socket.Listen(backlog);
