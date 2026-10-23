@@ -222,7 +222,7 @@ namespace Fleck.Handlers
                 writer.Write(payload);
 
             for (var i = 0; i < length; i++)
-                data[payloadStart + i] ^= mask[i % 4];
+                data[payloadStart + i] ^= mask[i & 3];
 
             return new MemoryBuffer(data, writer.Length);
         }
@@ -294,7 +294,7 @@ namespace Fleck.Handlers
                 {
                     for (var i = 0; i < payloadLength; i++)
                     {
-                        payloadData[i] = (byte)(payloadData[i] ^ maskBytes[i % 4]);
+                        payloadData[i] = (byte)(payloadData[i] ^ maskBytes[i & 3]);
                     }
                 }
 
