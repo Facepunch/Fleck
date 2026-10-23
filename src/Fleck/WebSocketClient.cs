@@ -66,7 +66,7 @@ namespace Fleck
         /// Connects and completes the websocket handshake. config runs before the connection opens, so it's where to set
         /// OnOpen, OnMessage and the rest. The task completes once the connection is open.
         /// </summary>
-        /// <param name="createAsyncConnection">Whether internal connection uses sync or async routines. Sync will block current thread but save on allocations</param>
+        /// <param name="createAsyncConnection">Whether internal connection uses sync or async routines. If false, will block current thread and offers no thread safety but save on allocations</param>
         public async Task<IWebSocketConnection> Connect(Action<IWebSocketConnection> config, bool createAsyncConnection = true)
         {
             if (config == null)
