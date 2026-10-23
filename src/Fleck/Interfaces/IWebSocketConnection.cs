@@ -22,5 +22,6 @@ namespace Fleck
         void Close(ushort code);
         IWebSocketConnectionInfo ConnectionInfo { get; }
         bool IsAvailable { get; }
+        int MaxPendingSends { get; set; }
     }
 }

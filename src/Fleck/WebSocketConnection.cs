@@ -25,6 +25,7 @@ namespace Fleck
         public Action<Exception> OnError { get; set; }
         public IWebSocketConnectionInfo ConnectionInfo { get; private set; }
         public bool IsAvailable => !_closing && !_closed && Socket.Connected;
+        public int MaxPendingSends { get; set; } = 2048;
 
         private readonly Action<IWebSocketConnection> _initialize;
         private readonly Func<IWebSocketConnection, WebSocketHttpRequest, IHandler> _handlerFactory;
@@ -538,7 +539,7 @@ namespace Fleck
 
         private void SendBytes(MemoryBuffer bytes, Action<WebSocketConnection, bool> callback = null, bool pump = true)
         {
-            if (Interlocked.Increment(ref _pendingSendCount) > 2048) // TODO: configure this limit/allow unlimited
+            if (Interlocked.Increment(ref _pendingSendCount) > MaxPendingSends && MaxPendingSends > 0)
             {
                 DecrementPending(); // never queued
                 bytes.Dispose();

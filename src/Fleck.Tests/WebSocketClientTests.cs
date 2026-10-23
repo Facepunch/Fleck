@@ -110,6 +110,7 @@ namespace Fleck.Tests
             var connection = await client.Connect(socket => socket.OnClose = () => closed.TrySetResult(true), useAsync);
             connection.Close();
             Assert.IsTrue(await Wait(closed));
+            Assert.IsFalse(connection.IsAvailable);
 
             var welcome = new TaskCompletionSource<bool>();
             connection = await client.Connect(socket => socket.OnOpen = () => welcome.TrySetResult(true), useAsync);
@@ -154,6 +155,43 @@ namespace Fleck.Tests
             var client = new WebSocketClient(Url);
             client.Headers["X-Test"] = "a\r\nInjected: yes";
             Assert.ThrowsAsync<ArgumentException>(async () => await client.Connect(socket => { }));
+        }
+
+        [Test]
+        public async Task DisconectsOnMaxPendingSends()
+        {
+            var error = new TaskCompletionSource<Exception>();
+            var client = new WebSocketClient(Url);
+            var connection = await client.Connect(socket => socket.OnError = (e) => error.SetException(e));
+            connection.MaxPendingSends = 1;
+            Parallel.For(0, 1000, (i) =>
+            {
+                if (!connection.IsAvailable)
+                {
+                    return;
+                }
+                connection.Send("123");
+            });
+            Assert.IsTrue(error.Task.IsFaulted);
+            Assert.IsTrue(error.Task.Exception.InnerException is InvalidOperationException);
+        }
+
+        [Test]
+        public async Task IgnoreMaxPendingSends()
+        {
+            var error = new TaskCompletionSource<Exception>();
+            var client = new WebSocketClient(Url);
+            var connection = await client.Connect(socket => socket.OnError = (e) => error.SetException(e));
+            connection.MaxPendingSends = 0;
+            Parallel.For(0, 1000, (i) =>
+            {
+                if (!connection.IsAvailable)
+                {
+                    return;
+                }
+                connection.Send("123");
+            });
+            Assert.IsFalse(error.Task.IsFaulted);
         }
     }
 }
