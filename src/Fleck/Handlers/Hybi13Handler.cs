@@ -15,6 +15,8 @@ namespace Fleck.Handlers
         private static readonly RandomNumberGenerator MaskGenerator = RandomNumberGenerator.Create();
         private static readonly ThreadLocal<StringBuilder> StringBuilder = new ThreadLocal<StringBuilder>(() => new StringBuilder(1024));
 
+        private static readonly ThreadLocal<byte[]> MaskBuffer = new ThreadLocal<byte[]>(() => new byte[4]);
+
         // buffers start small and grow on demand, so connections that never receive big messages don't hold big buffers
         private const int InitialBufferSize = 64 * 1024;
 
@@ -208,8 +210,8 @@ namespace Fleck.Handlers
                 return new MemoryBuffer(data, writer.Length);
             }
 
-            var mask = new byte[4];
-            MaskGenerator.GetBytes(mask);
+            byte[] mask = MaskBuffer.Value;
+            MaskGenerator.GetBytes(mask); // thread safe
             writer.Write((ReadOnlySpan<byte>)mask);
 
             var payloadStart = writer.Length;

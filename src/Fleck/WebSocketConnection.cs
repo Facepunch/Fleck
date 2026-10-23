@@ -55,6 +55,7 @@ namespace Fleck
         private Timer _handshakeTimer;
         private static readonly TimeSpan MaxTimerDueTime = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
         private readonly ConnectionLimiter _limiter;
+        private readonly bool _isAsync;
 
         public WebSocketConnection(
             ISocket socket,
@@ -62,7 +63,8 @@ namespace Fleck
             Func<ArraySegment<byte>, WebSocketHttpRequest> parseRequest,
             Func<IWebSocketConnection, WebSocketHttpRequest, IHandler> handlerFactory,
             ConnectionLimiter limiter,
-            TimeSpan? handshakeTimeout = null)
+            TimeSpan? handshakeTimeout = null,
+            bool isAsync = true)
         {
             Socket = socket;
             OnOpen = () => { };
@@ -76,6 +78,7 @@ namespace Fleck
             _handlerFactory = handlerFactory;
             _parseRequest = parseRequest;
             _limiter = limiter;
+            _isAsync = isAsync;
 
             // a client that never finishes its handshake (e.g. sending it a byte at a time) would otherwise hold its connection
             // and limiter slot forever. started here so it also covers a slow TLS negotiation
@@ -535,7 +538,7 @@ namespace Fleck
 
         private void SendBytes(MemoryBuffer bytes, Action<WebSocketConnection, bool> callback = null, bool pump = true)
         {
-            if (Interlocked.Increment(ref _pendingSendCount) > 2048)
+            if (Interlocked.Increment(ref _pendingSendCount) > 2048) // TODO: configure this limit/allow unlimited
             {
                 DecrementPending(); // never queued
                 bytes.Dispose();
@@ -552,21 +555,56 @@ namespace Fleck
                 return;
             }
 
-            // The completion callback is a cached static delegate and the per-send data (this connection, the buffer and the callback)
-            // is carried on a pooled state object passed as AsyncState, so no alloc on the send path
-            if (!_sendStatePool.TryTake(out var state))
+            if (_isAsync)
             {
-                state = new SendState();
+                // The completion callback is a cached static delegate and the per-send data (this connection, the buffer and the callback)
+                // is carried on a pooled state object passed as AsyncState, so no alloc on the send path
+                if (!_sendStatePool.TryTake(out var state))
+                {
+                    state = new SendState();
+                }
+
+                state.Connection = this;
+                state.Bytes = bytes;
+                state.Callback = callback;
+
+                _sendQueue.Enqueue(state);
+
+                if (pump)
+                    PumpSends();
             }
+            else
+            {
+                bool success = true;
+                try
+                {
+                    Socket.Stream.Write(bytes.Data, 0, bytes.Length);
+                }
+                catch(Exception e)
+                {
+                    HandleWriteError(e);
+                    success = false;
+                }
 
-            state.Connection = this;
-            state.Bytes = bytes;
-            state.Callback = callback;
+                try
+                {
+                    bytes.Dispose();
+                }
+                catch(Exception e)
+                {
+                    LogUnexpected("Error releasing a sent buffer", e);
+                }
+                DecrementPending();
 
-            _sendQueue.Enqueue(state);
-
-            if (pump)
-                PumpSends();
+                try
+                {
+                    callback?.Invoke(this, success);
+                }
+                catch(Exception e)
+                {
+                    RaiseError(e);
+                }
+            }
         }
 
         // Writes go out one at a time: a stream doesn't support overlapping writes (NetworkStream can split one into several

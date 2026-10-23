@@ -66,7 +66,8 @@ namespace Fleck
         /// Connects and completes the websocket handshake. config runs before the connection opens, so it's where to set
         /// OnOpen, OnMessage and the rest. The task completes once the connection is open.
         /// </summary>
-        public async Task<IWebSocketConnection> Connect(Action<IWebSocketConnection> config)
+        /// <param name="createAsyncConnection">Whether internal connection uses sync or async routines. Sync will block current thread but save on allocations</param>
+        public async Task<IWebSocketConnection> Connect(Action<IWebSocketConnection> config, bool createAsyncConnection = true)
         {
             if (config == null)
                 throw new ArgumentNullException(nameof(config));
@@ -107,7 +108,7 @@ namespace Fleck
 
                 wrapper.EnableQueuedWrites();
 
-                var connection = new WebSocketConnection(wrapper, null, null, null, null);
+                var connection = new WebSocketConnection(wrapper, null, null, null, null, isAsync: createAsyncConnection);
                 config(connection);
 
                 var info = WebSocketConnectionInfo.Create(CreateInfoRequest(subProtocol), wrapper.RemoteIpAddress, wrapper.RemotePort);

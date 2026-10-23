@@ -53,7 +53,7 @@ namespace Fleck.Tests
         }
 
         [Test]
-        public async Task TextRoundTripsWithServer()
+        public async Task TextRoundTripsWithServer([Values] bool useAsync)
         {
             var welcome = new TaskCompletionSource<string>();
             var echo = new TaskCompletionSource<string>();
@@ -66,7 +66,7 @@ namespace Fleck.Tests
                     if (message == "welcome") welcome.TrySetResult(message);
                     else echo.TrySetResult(message);
                 };
-            });
+            }, useAsync);
 
             Assert.AreEqual("welcome", await Wait(welcome));
             connection.Send("hello");
@@ -76,7 +76,7 @@ namespace Fleck.Tests
         }
 
         [Test]
-        public async Task LargeBinaryRoundTripsWithServer()
+        public async Task LargeBinaryRoundTripsWithServer([Values] bool useAsync)
         {
             var payload = new byte[200 * 1024];
             new Random(1).NextBytes(payload);
@@ -85,7 +85,7 @@ namespace Fleck.Tests
             var connection = await new WebSocketClient(Url).Connect(socket =>
             {
                 socket.OnBinary = data => received.TrySetResult(data.ToArray());
-            });
+            }, useAsync);
 
             connection.Send(Copy(payload));
             CollectionAssert.AreEqual(payload, await Wait(received));
@@ -93,17 +93,31 @@ namespace Fleck.Tests
         }
 
         [Test]
-        public async Task OnCloseRaisedWhenClosed()
+        public async Task OnCloseRaisedWhenClosed([Values] bool useAsync)
         {
             var closed = new TaskCompletionSource<bool>();
-            var connection = await new WebSocketClient(Url).Connect(socket => socket.OnClose = () => closed.TrySetResult(true));
+            var connection = await new WebSocketClient(Url).Connect(socket => socket.OnClose = () => closed.TrySetResult(true), useAsync);
 
             connection.Close();
             Assert.IsTrue(await Wait(closed));
         }
 
         [Test]
-        public void FailsWhenServerDoesNotUpgrade()
+        public async Task ReopensAfterClose([Values] bool useAsync)
+        {
+            var closed = new TaskCompletionSource<bool>();
+            var client = new WebSocketClient(Url);
+            var connection = await client.Connect(socket => socket.OnClose = () => closed.TrySetResult(true), useAsync);
+            connection.Close();
+            Assert.IsTrue(await Wait(closed));
+
+            var welcome = new TaskCompletionSource<bool>();
+            connection = await client.Connect(socket => socket.OnOpen = () => welcome.TrySetResult(true), useAsync);
+            Assert.IsTrue(await Wait(welcome));
+        }
+
+        [Test]
+        public void FailsWhenServerDoesNotUpgrade([Values] bool useAsync)
         {
             var listener = new TcpListener(IPAddress.Loopback, 0);
             listener.Start();
@@ -119,7 +133,7 @@ namespace Fleck.Tests
                 });
 
                 var client = new WebSocketClient($"ws://127.0.0.1:{port}/");
-                Assert.ThrowsAsync<WebSocketException>(async () => await client.Connect(socket => { }));
+                Assert.ThrowsAsync<WebSocketException>(async () => await client.Connect(socket => { }, useAsync));
                 accepting.Wait();
             }
             finally
