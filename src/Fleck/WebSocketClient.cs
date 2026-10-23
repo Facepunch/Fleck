@@ -106,7 +106,10 @@ namespace Fleck
                 var subProtocol = ValidateResponse(response.Request, key);
                 var leftover = response.Leftover;
 
-                wrapper.EnableQueuedWrites();
+                if (createAsyncConnection)
+                {
+                    wrapper.EnableQueuedWrites();
+                }
 
                 var connection = new WebSocketConnection(wrapper, null, null, null, null, isAsync: createAsyncConnection);
                 config(connection);

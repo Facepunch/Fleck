@@ -225,6 +225,11 @@ namespace Fleck
             {
                 try
                 {
+                    if(!instance._isAsync)
+                    {
+                        Volatile.Write(ref _handshakeQueued, 1);
+                    }
+
                     // Completion and timeout must choose one outcome before either raises application events.
                     if (success && Interlocked.CompareExchange(ref instance._handshakeState, HandshakeComplete, HandshakePending) == HandshakePending)
                     {
@@ -243,8 +248,11 @@ namespace Fleck
                 }
             }, pump: false);
 
-            Volatile.Write(ref _handshakeQueued, 1);
-            PumpSends();
+            if (_isAsync)
+            {
+                Volatile.Write(ref _handshakeQueued, 1);
+                PumpSends();
+            }
 
             return true;
         }
@@ -253,6 +261,12 @@ namespace Fleck
         // server sent after its handshake response, which belongs to the first frames
         internal void StartClient(IHandler handler, IWebSocketConnectionInfo info, ArraySegment<byte> leftover)
         {
+            if (Volatile.Read(ref _socketClosed) != 0)
+             {
+                 handler.Dispose();
+                 return;
+             }
+
             ConnectionInfo = info;
             Handler = handler;
             _receiveHandler = handler;
